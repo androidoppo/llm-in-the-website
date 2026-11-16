@@ -1,0 +1,877 @@
+From dcdf8fcbed0f748fd219bddce9fe693492121de6 Mon Sep 17 00:00:00 2001
+From: dev <dev@example.com>
+Date: Mon, 16 Nov 2026 07:35:45 +0000
+Subject: [PATCH] =?UTF-8?q?fix+feat:=20GGUF=20=E5=88=A4=E5=AE=9A=E3=81=AE?=
+ =?UTF-8?q?=E4=BF=AE=E6=AD=A3=E3=80=81KV=20=E3=82=AD=E3=83=A3=E3=83=83?=
+ =?UTF-8?q?=E3=82=B7=E3=83=A5=E9=87=8F=E5=AD=90=E5=8C=96=20GUI=E3=80=81LoR?=
+ =?UTF-8?q?A=20=E3=82=A2=E3=83=80=E3=83=97=E3=82=BF=E5=AF=BE=E5=BF=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fix: .gguf ファイルが「GGUF 形式ではない」と弾かれる不具合を修正
+
+- wllama の isValidGgufFile はパス/URL の文字列を受け取る API であり、
+  File オブジェクトを渡すと [object File] に文字列化されて常に false に
+  なっていた（ローカルの .gguf ファイルがインポートできなかった原因）。
+- 拡張子が .gguf かどうか（大文字小文字を問わず、クエリ文字列付き URL も
+  許容）をファイル名文字列で判定する isGgufFileName() を新設し、
+  モデル / LoRA の File 判定と URL 判定の両方で使用する。
+
+feat: GUI から KV キャッシュの量子化タイプを変更可能に
+
+- appConfig.ts に CACHE_TYPE_K / CACHE_TYPE_V（既定 f16）を追加。
+- types.ts に KvCacheType（f32/f16/q8_0/q5_1/q5_0/q4_1/q4_0）を追加。
+- settingsStore.ts に cacheTypeK / cacheTypeV を追加し localStorage に
+  永続化。旧バージョンの保存データとの互換のため既定値とマージする。
+- 右パネルに「KV キャッシュ」セクションを追加（K / V を個別に選択）。
+- V キャッシュを f16 以外にする場合は Flash Attention が必須という
+  llama.cpp の制約のため、ロード時に flash_attn を自動有効化し、
+  cache_type_k / cache_type_v を wllama の loadModel に渡す。
+
+feat: LoRA アダプタを GUI から追加・管理可能に
+
+- 左パネルに「LoRA アダプタ」セクションを追加。ローカルの .gguf
+  ファイルまたは URL で追加し、scale（0〜2）スライダー、有効 / 無効
+  トグル、削除が可能。
+- 登録された LoRA はメモリ上でのみ保持（ページ再読み込み後は再登録）。
+- モデルロード時に wllama の lora_adapters に渡す。wllama は渡された
+  blob 順に model-XXXXX-of-XXXXX.gguf として MEMFS に登録するため、
+  モデル blob の後ろに LoRA blob を連結し仮想パスを生成する。
+- LoRA ありで URL ロードする場合はモデルを自前でダウンロードして
+  loadModel(blobs) に合流する（split GGUF との同時使用は未対応）。
+---
+ src/components/panels/LeftPanel.tsx  | 156 +++++++++++++++
+ src/components/panels/RightPanel.tsx |  82 +++++++-
+ src/config/appConfig.ts              |   6 +
+ src/lib/engineStore.ts               | 288 +++++++++++++++++++++++++--
+ src/lib/settingsStore.ts             |  25 ++-
+ src/lib/types.ts                     |  25 +++
+ 6 files changed, 565 insertions(+), 17 deletions(-)
+
+diff --git a/src/components/panels/LeftPanel.tsx b/src/components/panels/LeftPanel.tsx
+index ccebdbd..53a2c86 100755
+--- a/src/components/panels/LeftPanel.tsx
++++ b/src/components/panels/LeftPanel.tsx
+@@ -2,8 +2,10 @@
+ 
+ import { useRef, useState } from "react";
+ import {
++  Blocks,
+   FileUp,
+   HardDriveDownload,
++  Link2,
+   Loader2,
+   MessageSquarePlus,
+   Plus,
+@@ -16,6 +18,8 @@ import { Progress } from "@/components/ui/progress";
+ import { Badge } from "@/components/ui/badge";
+ import { Separator } from "@/components/ui/separator";
+ import { ScrollArea } from "@/components/ui/scroll-area";
++import { Slider } from "@/components/ui/slider";
++import { Switch } from "@/components/ui/switch";
+ import { toast } from "sonner";
+ import { APP_CONFIG } from "@/config/appConfig";
+ import { useEngineStore } from "@/lib/engineStore";
+@@ -162,6 +166,156 @@ function ModelSection() {
+   );
+ }
+ 
++function LoraSection() {
++  const engine = useEngineStore();
++  const loraAdapters = useEngineStore((s) => s.loraAdapters);
++  const addLoraFiles = useEngineStore((s) => s.addLoraFiles);
++  const addLoraUrl = useEngineStore((s) => s.addLoraUrl);
++  const removeLora = useEngineStore((s) => s.removeLora);
++  const setLoraScale = useEngineStore((s) => s.setLoraScale);
++  const toggleLora = useEngineStore((s) => s.toggleLora);
++  const [url, setUrl] = useState("");
++  const loraFileInputRef = useRef<HTMLInputElement>(null);
++
++  const generatingChatId = useChatStore((s) => s.generatingChatId);
++  const isLoading = engine.status === "loading";
++  const isGenerating = generatingChatId !== null;
++  const disabled = isLoading || isGenerating;
++  const enabledCount = loraAdapters.filter((a) => a.enabled).length;
++  const needsReload = engine.status === "ready" && enabledCount > 0;
++
++  const handleAddUrl = () => {
++    if (!url.trim()) return;
++    addLoraUrl(url.trim());
++    setUrl("");
++  };
++
++  const handleLoraFiles = (files: FileList | null) => {
++    if (!files || files.length === 0) return;
++    addLoraFiles(Array.from(files));
++    if (loraFileInputRef.current) loraFileInputRef.current.value = "";
++  };
++
++  return (
++    <div className="space-y-3 p-4">
++      <div className="flex items-center justify-between">
++        <h2 className="flex items-center gap-1.5 text-sm font-semibold">
++          <Blocks className="size-4" /> LoRA アダプタ
++        </h2>
++        {loraAdapters.length > 0 && (
++          <Badge variant={enabledCount > 0 ? "default" : "secondary"}>
++            {enabledCount > 0 ? `${enabledCount} 件 有効` : "無効"}
++          </Badge>
++        )}
++      </div>
++
++      <p className="text-[10px] leading-relaxed text-muted-foreground">
++        モデルロード時に適用されます。追加・変更後はモデルを再ロードしてください。
++      </p>
++
++      {/* URL 追加 */}
++      <div className="flex gap-1.5">
++        <Input
++          value={url}
++          onChange={(e) => setUrl(e.target.value)}
++          onKeyDown={(e) => {
++            if (e.key === "Enter") handleAddUrl();
++          }}
++          placeholder="https://.../my-lora.gguf"
++          className="h-8 text-xs"
++          disabled={disabled}
++        />
++        <Button
++          size="sm"
++          variant="outline"
++          className="h-8 shrink-0 px-2"
++          onClick={handleAddUrl}
++          disabled={disabled || !url.trim()}
++          title="URL から LoRA を追加"
++        >
++          <Link2 className="size-3.5" />
++        </Button>
++      </div>
++
++      {/* ファイル追加 */}
++      <Input
++        ref={loraFileInputRef}
++        type="file"
++        accept=".gguf"
++        multiple
++        className="h-8 text-xs"
++        onChange={(e) => void handleLoraFiles(e.target.files)}
++        disabled={disabled}
++      />
++
++      {/* アダプタ一覧 */}
++      {loraAdapters.length === 0 ? (
++        <p className="text-xs text-muted-foreground">追加された LoRA はありません。</p>
++      ) : (
++        <div className="space-y-2">
++          {loraAdapters.map((a) => (
++            <div key={a.id} className="space-y-1.5 rounded-md border p-2.5">
++              <div className="flex items-center gap-2">
++                <Switch
++                  checked={a.enabled}
++                  onCheckedChange={() => toggleLora(a.id)}
++                  disabled={disabled}
++                  aria-label={`LoRA ${a.name} を${a.enabled ? "無効化" : "有効化"}`}
++                />
++                <span className="min-w-0 flex-1 truncate text-xs" title={a.name}>
++                  {a.name}
++                </span>
++                <Badge variant="outline" className="shrink-0 text-[10px]">
++                  {a.kind === "url" ? "URL" : "ローカル"}
++                </Badge>
++                {a.sizeBytes !== null && (
++                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
++                    {formatBytes(a.sizeBytes)}
++                  </span>
++                )}
++                <Button
++                  size="sm"
++                  variant="ghost"
++                  className="h-7 shrink-0 px-1.5"
++                  onClick={() => {
++                    removeLora(a.id);
++                    toast.success("LoRA を削除しました");
++                  }}
++                  disabled={disabled}
++                  aria-label={`LoRA ${a.name} を削除`}
++                >
++                  <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
++                </Button>
++              </div>
++              <div className="flex items-center gap-2 pl-1">
++                <span className="w-16 shrink-0 text-[10px] text-muted-foreground">scale</span>
++                <Slider
++                  min={0}
++                  max={2}
++                  step={0.05}
++                  value={[a.scale]}
++                  onValueChange={([v]) => setLoraScale(a.id, v)}
++                  disabled={disabled}
++                  className="flex-1"
++                />
++                <span className="w-10 shrink-0 text-right font-mono text-[10px]">
++                  {a.scale.toFixed(2)}
++                </span>
++              </div>
++            </div>
++          ))}
++        </div>
++      )}
++
++      {needsReload && (
++        <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-[10px] text-amber-700 dark:text-amber-400">
++          LoRA の変更は次回のモデルロード時に適用されます。
++        </p>
++      )}
++    </div>
++  );
++}
++
+ function ChatListSection() {
+   const chats = useChatStore((s) => s.chats);
+   const activeChatId = useChatStore((s) => s.activeChatId);
+@@ -241,6 +395,8 @@ export function LeftPanel() {
+     <div className="flex h-full min-h-0 flex-col">
+       <ModelSection />
+       <Separator />
++      <LoraSection />
++      <Separator />
+       <ChatListSection />
+     </div>
+   );
+diff --git a/src/components/panels/RightPanel.tsx b/src/components/panels/RightPanel.tsx
+index 259d77a..517dcd9 100755
+--- a/src/components/panels/RightPanel.tsx
++++ b/src/components/panels/RightPanel.tsx
+@@ -8,10 +8,17 @@ import { Slider } from "@/components/ui/slider";
+ import { Textarea } from "@/components/ui/textarea";
+ import { Progress } from "@/components/ui/progress";
+ import { Separator } from "@/components/ui/separator";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
+ import { APP_CONFIG } from "@/config/appConfig";
+ import { useEngineStore } from "@/lib/engineStore";
+ import { useChatStore } from "@/lib/chatStore";
+-import { useSettingsStore } from "@/lib/settingsStore";
++import { KV_CACHE_TYPE_OPTIONS, useSettingsStore } from "@/lib/settingsStore";
+ import { estimateTokens, formatTokenCount } from "@/lib/tokenEstimate";
+ import { cn } from "@/lib/utils";
+ 
+@@ -186,11 +193,84 @@ function ParamsSection() {
+   );
+ }
+ 
++function KvCacheSection() {
++  const params = useSettingsStore((s) => s.params);
++  const setParam = useSettingsStore((s) => s.setParam);
++  const engineStatus = useEngineStore((s) => s.status);
++
++  const vQuantized = params.cacheTypeV !== "f16";
++
++  return (
++    <div className="space-y-3 p-4">
++      <h2 className="text-sm font-semibold">KV キャッシュ</h2>
++      <p className="text-[10px] leading-relaxed text-muted-foreground">
++        KV キャッシュを量子化するとメモリ使用量を削減できます。変更は次回のモデルロード時に適用されます。
++      </p>
++
++      <div className="space-y-1.5">
++        <Label htmlFor="cache-type-k" className="text-xs">
++          K キャッシュの型
++        </Label>
++        <Select
++          value={params.cacheTypeK}
++          onValueChange={(v) => setParam("cacheTypeK", v as typeof params.cacheTypeK)}
++        >
++          <SelectTrigger id="cache-type-k" className="h-8 text-xs">
++            <SelectValue />
++          </SelectTrigger>
++          <SelectContent>
++            {KV_CACHE_TYPE_OPTIONS.map((o) => (
++              <SelectItem key={o.value} value={o.value} className="text-xs">
++                {o.label}
++              </SelectItem>
++            ))}
++          </SelectContent>
++        </Select>
++      </div>
++
++      <div className="space-y-1.5">
++        <Label htmlFor="cache-type-v" className="text-xs">
++          V キャッシュの型
++        </Label>
++        <Select
++          value={params.cacheTypeV}
++          onValueChange={(v) => setParam("cacheTypeV", v as typeof params.cacheTypeV)}
++        >
++          <SelectTrigger id="cache-type-v" className="h-8 text-xs">
++            <SelectValue />
++          </SelectTrigger>
++          <SelectContent>
++            {KV_CACHE_TYPE_OPTIONS.map((o) => (
++              <SelectItem key={o.value} value={o.value} className="text-xs">
++                {o.label}
++              </SelectItem>
++            ))}
++          </SelectContent>
++        </Select>
++        {vQuantized && (
++          <p className="flex items-start gap-1 text-[10px] text-amber-600 dark:text-amber-400">
++            <TriangleAlert className="mt-0.5 size-3 shrink-0" />
++            V キャッシュの量子化には Flash Attention が必要なため、ロード時に自動で有効化されます。
++          </p>
++        )}
++      </div>
++
++      {engineStatus === "ready" && (
++        <p className="text-[10px] text-muted-foreground">
++          現在の設定は次回ロード時に反映されます（アンロード → 再ロードで適用）。
++        </p>
++      )}
++    </div>
++  );
++}
++
+ export function RightPanel() {
+   return (
+     <div className="h-full overflow-y-auto">
+       <ParamsSection />
+       <Separator />
++      <KvCacheSection />
++      <Separator />
+       <TokenStatsSection />
+     </div>
+   );
+diff --git a/src/config/appConfig.ts b/src/config/appConfig.ts
+index d4197f7..cd7ab1b 100755
+--- a/src/config/appConfig.ts
++++ b/src/config/appConfig.ts
+@@ -19,6 +19,7 @@
+  * 11. STOP_SEQUENCES         停止シーケンス
+  * 12. SYSTEM_PROMPT          既定のシステムプロンプト
+  * 13. CONTEXT_WARNING_RATIO  コンテキスト使用率の警告しきい値（0.8 = 80%）
++ * 14. CACHE_TYPE_K / CACHE_TYPE_V  KV キャッシュの量子化タイプ（GUI から変更可）
+  */
+ 
+ /** 既定モデル: ggml-org/Qwen3-0.6B-GGUF（Q4_0 / 約 410MB / チャットテンプレート同梱） */
+@@ -43,6 +44,11 @@ export const APP_CONFIG = {
+   N_BATCH: 512,
+   FLASH_ATTN: true,
+ 
++  // ---------- KV キャッシュ量子化（GUI から変更可・次回ロード時に適用） ----------
++  /** V キャッシュを f16 以外にする場合は Flash Attention が必要（自動で有効化） */
++  CACHE_TYPE_K: "f16",
++  CACHE_TYPE_V: "f16",
++
+   // ---------- 生成パラメータ ----------
+   TEMPERATURE: 0.8,
+   TOP_P: 0.9,
+diff --git a/src/lib/engineStore.ts b/src/lib/engineStore.ts
+index e89b633..9fe9289 100644
+--- a/src/lib/engineStore.ts
++++ b/src/lib/engineStore.ts
+@@ -6,13 +6,16 @@
+  * - 推論本体は wllama 内部の Web Worker で実行されるため UI はブロックされない
+  * - モデルはメモリ上でのみ動作（URL 导入はキャッシュしない / 計画書 M-2）
+  * - メモリ対策として N_CTX の階梯フォールバックを実装（計画書 M-4）
++ * - LoRA アダプタはモデルロード時に wllama の lora_adapters として適用する
++ *   （wllama はロード時に MEMFS へ全 blob を model-XXXXX-of-XXXXX.gguf として
++ *    登録するため、LoRA blob をモデル blob の後ろに並べて仮想パスを指定する）
+  */
+ import { create } from "zustand";
+-import { Wllama, isValidGgufFile } from "@wllama/wllama";
++import { Wllama } from "@wllama/wllama";
+ import type { LoadedContextInfo } from "@wllama/wllama";
+ import { APP_CONFIG } from "@/config/appConfig";
+ import { useSettingsStore } from "@/lib/settingsStore";
+-import type { EngineStatus, LoadProgress } from "@/lib/types";
++import type { EngineStatus, LoraAdapter, LoadProgress } from "@/lib/types";
+ 
+ let wllamaInstance: Wllama | null = null;
+ 
+@@ -85,6 +88,24 @@ function isMemoryError(err: unknown): boolean {
+   return /memory|alloc|out of|kvwasm|buffer/i.test(msg);
+ }
+ 
++/** GGUF 判定。wllama の isValidGgufFile は File オブジェクトを受け取れない
++ * （文字列化され [object File] になる）ため、必ず「ファイル名文字列」で判定する。
++ * 大文字拡張子 (.GGUF) も許容する。 */
++function isGgufFileName(name: string): boolean {
++  return /\.gguf(\?.*)?$/i.test(name.trim());
++}
++
++let loraIdCounter = 0;
++function newLoraId(): string {
++  loraIdCounter += 1;
++  return `lora-${Date.now()}-${loraIdCounter}`;
++}
++
++/** 数値を 5 桁ゼロ埋め（wllama prepareBlobs のリネーム規則と同一） */
++function pad5(n: number): string {
++  return String(n).padStart(5, "0");
++}
++
+ /** URL から表示名を抽出 */
+ function nameFromUrl(url: string): string {
+   try {
+@@ -95,6 +116,67 @@ function nameFromUrl(url: string): string {
+   }
+ }
+ 
++/**
++ * split GGUF の先頭ファイル URL から全シャード URL を導出する。
++ * 例: ...-00001-of-00003.gguf → [...-00001-..., ...-00002-..., ...-00003-...]
++ */
++function deriveShardUrls(url: string): string[] {
++  const re = /-(\d{5})-of-(\d{5})\.gguf(?=\?|$)/i;
++  const m = url.match(re);
++  if (!m) return [url];
++  const total = parseInt(m[2], 10);
++  if (!Number.isFinite(total) || total <= 1) return [url];
++  return Array.from({ length: total }, (_, i) =>
++    url.replace(re, `-${pad5(i + 1)}-of-${pad5(total)}.gguf`)
++  );
++}
++
++/** fetch で blob をダウンロードし進捗を報告する（wllama のキャッシュを使わない単純取得） */
++async function fetchBlobWithProgress(
++  url: string,
++  onProgress: (loadedSoFar: number, total: number) => void
++): Promise<{ blob: Blob; size: number }> {
++  const res = await fetch(url);
++  if (!res.ok) {
++    throw new Error(`ダウンロードに失敗しました (${res.status}): ${nameFromUrl(url)}`);
++  }
++  const contentLength = Number(res.headers.get("content-length") ?? 0) || null;
++  if (!res.body) {
++    const blob = await res.blob();
++    onProgress(blob.size, blob.size);
++    return { blob, size: blob.size };
++  }
++  const reader = res.body.getReader();
++  const chunks: ArrayBuffer[] = [];
++  let loaded = 0;
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    if (value) {
++      chunks.push(value.slice().buffer as ArrayBuffer);
++      loaded += value.byteLength;
++      onProgress(loaded, contentLength ?? loaded);
++    }
++  }
++  return { blob: new Blob(chunks), size: loaded };
++}
++
++/**
++ * LoRA blob を含めたロードを行う。wllama は渡された blob 順に
++ * model-00001-of-NNNNN.gguf … とリネームして MEMFS に登録するため、
++ * モデル blob の後ろに LoRA blob を並べ、その仮想パスを lora_adapters に指定する。
++ */
++function buildLoraAdaptersParams(
++  modelBlobCount: number,
++  loraBlobs: { scale: number }[]
++): { path: string; scale: number }[] {
++  const total = modelBlobCount + loraBlobs.length;
++  return loraBlobs.map((_, i) => ({
++    path: `models/model-${pad5(modelBlobCount + i + 1)}-of-${pad5(total)}.gguf`,
++    scale: loraBlobs[i].scale,
++  }));
++}
++
+ interface EngineState {
+   status: EngineStatus;
+   progress: LoadProgress | null;
+@@ -112,23 +194,34 @@ interface EngineState {
+   tokPerSec: number | null;
+   /** 現在の会話が消費しているコンテキストトークン数（実測値） */
+   contextTokens: number;
++  /** 登録済み LoRA アダプタ（メモリ上のみ・アンロード後も保持） */
++  loraAdapters: LoraAdapter[];
+ 
+   loadFromUrl: (url: string) => Promise<void>;
+   loadFromFiles: (files: File[]) => Promise<void>;
+   unload: () => Promise<void>;
++  addLoraFiles: (files: File[]) => void;
++  addLoraUrl: (url: string) => void;
++  removeLora: (id: string) => void;
++  setLoraScale: (id: string, scale: number) => void;
++  toggleLora: (id: string) => void;
+   setTokPerSec: (t: number | null) => void;
+   setContextTokens: (n: number) => void;
+   clearError: () => void;
+ }
+ 
+-function buildLoadParams(nCtx: number, webgpu: boolean) {
++function buildLoadParams(nCtx: number, webgpu: boolean, loraAdapters?: { path: string; scale: number }[]) {
+   const { params } = useSettingsStore.getState();
+   return {
+     n_ctx: nCtx,
+     n_gpu_layers: webgpu ? APP_CONFIG.N_GPU_LAYERS : 0,
+     n_threads: APP_CONFIG.N_THREADS > 0 ? APP_CONFIG.N_THREADS : undefined,
+     n_batch: APP_CONFIG.N_BATCH,
+-    flash_attn: APP_CONFIG.FLASH_ATTN,
++    // V キャッシュを f16 以外に量子化する場合は Flash Attention が必須（llama.cpp の制約）
++    flash_attn: APP_CONFIG.FLASH_ATTN || params.cacheTypeV !== "f16",
++    cache_type_k: params.cacheTypeK,
++    cache_type_v: params.cacheTypeV,
++    ...(loraAdapters && loraAdapters.length > 0 ? { lora_adapters: loraAdapters } : {}),
+   };
+ }
+ 
+@@ -182,6 +275,29 @@ async function loadWithLadder(
+   throw lastErr;
+ }
+ 
++/** 有効化されている LoRA をすべて blob 化して返す（URL のものはこの場でダウンロード） */
++async function resolveEnabledLoras(
++  onProgress: (loadedSoFar: number, total: number) => void
++): Promise<{ blobs: Blob[]; scales: number[]; sizeBytes: number }> {
++  const enabled = useEngineStore.getState().loraAdapters.filter((a) => a.enabled);
++  const blobs: Blob[] = [];
++  const scales: number[] = [];
++  let sizeBytes = 0;
++  for (const a of enabled) {
++    if (a.kind === "file" && a.file) {
++      blobs.push(a.file);
++      scales.push(a.scale);
++      sizeBytes += a.file.size;
++    } else if (a.kind === "url" && a.url) {
++      const { blob, size } = await fetchBlobWithProgress(a.url, onProgress);
++      blobs.push(blob);
++      scales.push(a.scale);
++      sizeBytes += size;
++    }
++  }
++  return { blobs, scales, sizeBytes };
++}
++
+ export const useEngineStore = create<EngineState>((set, get) => ({
+   status: "idle",
+   progress: null,
+@@ -195,17 +311,83 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+   multithread: false,
+   tokPerSec: null,
+   contextTokens: 0,
++  loraAdapters: [],
+ 
+   clearError: () => set({ error: null }),
+ 
+   setTokPerSec: (t) => set({ tokPerSec: t }),
+   setContextTokens: (n) => set({ contextTokens: n }),
+ 
++  // ---------- LoRA 管理 ----------
++  addLoraFiles: (files) => {
++    const valid = files.filter((f) => isGgufFileName(f.name));
++    if (valid.length === 0) {
++      set({ error: "LoRA は GGUF 形式（.gguf）のみ対応しています。" });
++      return;
++    }
++    set((state) => ({
++      error: null,
++      loraAdapters: [
++        ...state.loraAdapters,
++        ...valid.map((f) => ({
++          id: newLoraId(),
++          name: f.name,
++          kind: "file" as const,
++          file: f,
++          sizeBytes: f.size,
++          scale: 1,
++          enabled: true,
++        })),
++      ],
++    }));
++  },
++
++  addLoraUrl: (url) => {
++    const trimmed = url.trim();
++    if (!trimmed) return;
++    if (!isGgufFileName(nameFromUrl(trimmed))) {
++      set({ error: "LoRA の URL は .gguf で終わる必要があります。" });
++      return;
++    }
++    set((state) => ({
++      error: null,
++      loraAdapters: [
++        ...state.loraAdapters,
++        {
++          id: newLoraId(),
++          name: nameFromUrl(trimmed),
++          kind: "url",
++          url: trimmed,
++          sizeBytes: null,
++          scale: 1,
++          enabled: true,
++        },
++      ],
++    }));
++  },
++
++  removeLora: (id) =>
++    set((state) => ({ loraAdapters: state.loraAdapters.filter((a) => a.id !== id) })),
++
++  setLoraScale: (id, scale) =>
++    set((state) => ({
++      loraAdapters: state.loraAdapters.map((a) =>
++        a.id === id ? { ...a, scale: Math.min(2, Math.max(0, scale)) } : a
++      ),
++    })),
++
++  toggleLora: (id) =>
++    set((state) => ({
++      loraAdapters: state.loraAdapters.map((a) =>
++        a.id === id ? { ...a, enabled: !a.enabled } : a
++      ),
++    })),
++
+   // ---------- モデルロード ----------
+   loadFromUrl: async (url) => {
+     const wllama = getWllama();
+     if (get().status === "loading") return;
+-    if (!isValidGgufFile(url)) {
++    if (!isGgufFileName(nameFromUrl(url))) {
+       set({ error: "URL は .gguf で終わる必要があります。" });
+       return;
+     }
+@@ -234,13 +416,63 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+       });
+ 
+     try {
+-      const fallback = await loadWithLadder(wllama, async (nCtx) => {
+-        await wllama.loadModelFromUrl(url, {
+-          ...buildLoadParams(nCtx, webgpu),
+-          // 計画書 M-2: モデルはメモリ上でのみ動作させ、キャッシュは保持しない
+-          useCache: false,
+-          progressCallback: ({ loaded, total }) => setProgress(loaded, total),
++      const loras = get().loraAdapters.filter((a) => a.enabled);
++
++      if (loras.length === 0) {
++        // LoRA なし: 従来どおり wllama のダウンローダを使用
++        const fallback = await loadWithLadder(wllama, async (nCtx) => {
++          await wllama.loadModelFromUrl(url, {
++            ...buildLoadParams(nCtx, webgpu),
++            // 計画書 M-2: モデルはメモリ上でのみ動作させ、キャッシュは保持しない
++            useCache: false,
++            progressCallback: ({ loaded, total }) => setProgress(loaded, total),
++          });
++          assertLoadSucceeded(wllama);
+         });
++        const ctxInfo = wllama.getLoadedContextInfo();
++        set({
++          status: "ready",
++          progress: null,
++          ctxInfo,
++          multithread: wllama.isMultithread(),
++          ctxFallbackNotice: fallback
++            ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
++            : null,
++          contextTokens: 0,
++          tokPerSec: null,
++        });
++        return;
++      }
++
++      // LoRA あり: 自前でダウンロードして blob を組み合わせる
++      // （wllama の loadModelFromUrl には LoRA blob を合流できないため）
++      const shardUrls = deriveShardUrls(url);
++      if (shardUrls.length > 1) {
++        set({
++          status: "error",
++          progress: null,
++          error:
++            "分割 GGUF と LoRA の同時使用は対応していません。単一ファイルのモデルを利用してください。",
++        });
++        return;
++      }
++
++      const { blob: modelBlob, size: modelSize } = await fetchBlobWithProgress(
++        url,
++        (l, t) => setProgress(l, t)
++      );
++      set({ modelSizeBytes: modelSize });
++      const { blobs: loraBlobs, scales, sizeBytes: loraSizeBytes } =
++        await resolveEnabledLoras((l, t) => setProgress(l, t));
++
++      const blobs = [modelBlob, ...loraBlobs];
++      const loraAdaptersParams = buildLoraAdaptersParams(
++        1,
++        scales.map((s) => ({ scale: s }))
++      );
++
++      const fallback = await loadWithLadder(wllama, async (nCtx) => {
++        await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpu, loraAdaptersParams));
+         assertLoadSucceeded(wllama);
+       });
+       const ctxInfo = wllama.getLoadedContextInfo();
+@@ -249,6 +481,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+         progress: null,
+         ctxInfo,
+         multithread: wllama.isMultithread(),
++        modelSizeBytes: modelSize + loraSizeBytes,
+         ctxFallbackNotice: fallback
+           ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
+           : null,
+@@ -272,8 +505,9 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+     if (files.length === 0) return;
+     // 既存のモデル / 失敗残留の WASM モジュールを解放（再ロード・モデル切替を可能にする）
+     await safeExit(wllama);
+-    // GGUF ファイルかどうかを wllama の検証関数で判定する
+-    const invalid = files.find((f) => !isValidGgufFile(f as unknown as string));
++    // wllama の isValidGgufFile に File オブジェクトを渡すと常に false になるため、
++    // ファイル名文字列で判定する
++    const invalid = files.find((f) => !isGgufFileName(f.name));
+     if (invalid) {
+       set({ error: `GGUF 形式のみ対応しています: ${invalid.name}` });
+       return;
+@@ -297,8 +531,31 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+       webgpuActive: webgpu,
+     });
+     try {
++      const enabledLoras = get().loraAdapters.filter((a) => a.enabled);
++      if (enabledLoras.length > 0 && files.length > 1) {
++        set({
++          status: "error",
++          progress: null,
++          error:
++            "分割 GGUF と LoRA の同時使用は対応していません。単一ファイルのモデルを利用してください。",
++        });
++        return;
++      }
++      const loraBlobs = enabledLoras.map((a) => a.file as Blob);
++      const loraScales = enabledLoras.map((a) => a.scale);
++      const loraSizeBytes = enabledLoras.reduce(
++        (acc, a) => acc + (a.sizeBytes ?? 0),
++        0
++      );
++
++      const blobs: Blob[] = [...files, ...loraBlobs];
++      const loraAdaptersParams =
++        loraBlobs.length > 0
++          ? buildLoraAdaptersParams(files.length, loraScales.map((s) => ({ scale: s })))
++          : undefined;
++
+       const fallback = await loadWithLadder(wllama, async (nCtx) => {
+-        await wllama.loadModel(files, buildLoadParams(nCtx, webgpu));
++        await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpu, loraAdaptersParams));
+         assertLoadSucceeded(wllama);
+       });
+       const ctxInfo = wllama.getLoadedContextInfo();
+@@ -307,7 +564,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+         progress: null,
+         ctxInfo,
+         multithread: wllama.isMultithread(),
+-        modelSizeBytes: files.reduce((acc, f) => acc + f.size, 0),
++        modelSizeBytes: files.reduce((acc, f) => acc + f.size, 0) + loraSizeBytes,
+         ctxFallbackNotice: fallback
+           ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
+           : null,
+@@ -340,6 +597,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
+       contextTokens: 0,
+       tokPerSec: null,
+       error: null,
++      // loraAdapters は保持（次回ロード時に再適用できる）
+     });
+   },
+ }));
+diff --git a/src/lib/settingsStore.ts b/src/lib/settingsStore.ts
+index 50804a8..257122c 100755
+--- a/src/lib/settingsStore.ts
++++ b/src/lib/settingsStore.ts
+@@ -8,7 +8,7 @@
+ import { create } from "zustand";
+ import { persist, createJSONStorage } from "zustand/middleware";
+ import { APP_CONFIG } from "@/config/appConfig";
+-import type { GenerationParams } from "@/lib/types";
++import type { GenerationParams, KvCacheType } from "@/lib/types";
+ 
+ const DEFAULT_PARAMS: GenerationParams = {
+   temperature: APP_CONFIG.TEMPERATURE,
+@@ -16,6 +16,8 @@ const DEFAULT_PARAMS: GenerationParams = {
+   maxNewTokens: APP_CONFIG.MAX_NEW_TOKENS,
+   stopSequences: APP_CONFIG.STOP_SEQUENCES.join(", "),
+   systemPrompt: APP_CONFIG.SYSTEM_PROMPT,
++  cacheTypeK: APP_CONFIG.CACHE_TYPE_K,
++  cacheTypeV: APP_CONFIG.CACHE_TYPE_V,
+ };
+ 
+ interface SettingsState {
+@@ -37,6 +39,27 @@ export const useSettingsStore = create<SettingsState>()(
+       name: APP_CONFIG.SETTINGS_STORAGE_KEY,
+       storage: createJSONStorage(() => localStorage),
+       skipHydration: true,
++      // 古い localStorage（cacheTypeK/V が存在しない）との互換:
++      // params は入れ替えではなく既定値とマージする
++      merge: (persisted, current) => {
++        const persistedParams =
++          (persisted as { params?: Partial<GenerationParams> } | undefined)?.params ?? {};
++        return {
++          ...current,
++          params: { ...DEFAULT_PARAMS, ...persistedParams },
++        };
++      },
+     }
+   )
+ );
++
++/** KV キャッシュ量子化タイプの選択肢（表示順 = 量子化率の高い順） */
++export const KV_CACHE_TYPE_OPTIONS: { value: KvCacheType; label: string }[] = [
++  { value: "f16", label: "f16（半精度・既定）" },
++  { value: "f32", label: "f32（単精度）" },
++  { value: "q8_0", label: "q8_0（軽量量子化）" },
++  { value: "q5_1", label: "q5_1" },
++  { value: "q5_0", label: "q5_0" },
++  { value: "q4_1", label: "q4_1" },
++  { value: "q4_0", label: "q4_0（最小メモリ）" },
++];
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 45b2273..b05af2b 100755
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -28,6 +28,27 @@ export interface Chat {
+   totalTokens: number;
+ }
+ 
++/** KV キャッシュの量子化タイプ（wllama cache_type_k / cache_type_v） */
++export type KvCacheType = "f32" | "f16" | "q8_0" | "q5_1" | "q5_0" | "q4_1" | "q4_0";
++
++/** LoRA アダプタ（メモリ上のみ。ページ再読込後は再登録が必要） */
++export interface LoraAdapter {
++  id: string;
++  /** 表示名（ファイル名 or URL から抽出） */
++  name: string;
++  /** 登録元: ローカルファイル or URL */
++  kind: "file" | "url";
++  /** kind = "url" のときのダウンロード元 URL */
++  url?: string;
++  /** kind = "file" のときの生ファイル（Blob 参照、メモリ上のみ） */
++  file?: File;
++  sizeBytes: number | null;
++  /** 適用強度（llama.cpp の lora scale。1.0 が既定） */
++  scale: number;
++  /** 無効化されている場合はモデルロード時に適用されない */
++  enabled: boolean;
++}
++
+ /** 生成パラメータ（appConfig の値を初期値として UI から上書きできる） */
+ export interface GenerationParams {
+   temperature: number;
+@@ -36,6 +57,10 @@ export interface GenerationParams {
+   /** UI 上はカンマ区切り文字列で編集する */
+   stopSequences: string;
+   systemPrompt: string;
++  /** KV キャッシュ (K) の量子化タイプ。次回モデルロード時に適用 */
++  cacheTypeK: KvCacheType;
++  /** KV キャッシュ (V) の量子化タイプ。f16 以外は Flash Attention が必須（自動有効化） */
++  cacheTypeV: KvCacheType;
+ }
+ 
+ /** モデルの稼働状態 */
+-- 
+2.47.3
+
