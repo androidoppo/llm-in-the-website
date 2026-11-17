@@ -12,6 +12,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { v4 as uuidv4 } from "uuid";
 import type { Wllama } from "@wllama/wllama";
 import { APP_CONFIG } from "@/config/appConfig";
+import { pushDebugLog } from "@/lib/debugLogStore";
 import { useEngineStore, getWllama } from "@/lib/engineStore";
 import { useSettingsStore } from "@/lib/settingsStore";
 import { estimateTokens } from "@/lib/tokenEstimate";
@@ -32,6 +33,10 @@ function makeChat(title = "新しいチャット"): Chat {
 
 function makeMessage(role: Role, content: string, tokenCount: number | null = null): ChatMessage {
   return { id: uuidv4(), role, content, createdAt: Date.now(), tokenCount };
+}
+
+function appLog(level: "debug" | "info" | "warn" | "error", message: string) {
+  pushDebugLog(level, "app", message);
 }
 
 interface ChatState {
@@ -121,6 +126,15 @@ export const useChatStore = create<ChatState>()(
             .map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
         ];
 
+        const estPromptTokens = apiMessages.reduce(
+          (acc, m) => acc + estimateTokens(m.content),
+          0
+        );
+        appLog(
+          "info",
+          `生成開始: chat=${chatId.slice(0, 8)} messages=${apiMessages.length} 推定prompt=${estPromptTokens}tok temp=${settings.params.temperature} max_tokens=${settings.params.maxNewTokens}`
+        );
+
         generationAbort = new AbortController();
         let buffer = "";
         let lastFlush = 0;
@@ -147,7 +161,10 @@ export const useChatStore = create<ChatState>()(
             }
             const delta = chunk.choices[0]?.delta?.content;
             if (delta) {
-              if (firstTokenAt === null) firstTokenAt = performance.now();
+              if (firstTokenAt === null) {
+                firstTokenAt = performance.now();
+                appLog("debug", `最初のトークン受信: ${(firstTokenAt / 1000).toFixed(2)}s`);
+              }
               buffer += delta;
               const now = performance.now();
               if (now - lastFlush > 50) {
@@ -160,10 +177,12 @@ export const useChatStore = create<ChatState>()(
           const name = (err as { name?: string })?.name || "";
           if (name === "WllamaAbortError" || name === "AbortError") {
             // 中断: ここまでの内容を保持
+            appLog("info", `生成を中断しました: chat=${chatId.slice(0, 8)} 出力済み=${buffer.length}文字`);
             patchMessage(chatId, assistantMsg.id, { content: buffer, stopped: true });
           } else {
             console.error("生成エラー:", err);
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+            appLog("error", `生成エラー: chat=${chatId.slice(0, 8)} ${msg}`);
             set({ lastError: `生成中にエラーが発生しました: ${msg}` });
             if (buffer.length === 0) {
               // 空のままならプレースホルダを取り除く
@@ -206,6 +225,10 @@ export const useChatStore = create<ChatState>()(
           content: buffer,
           tokenCount: completionTokens,
         });
+        appLog(
+          "info",
+          `生成完了: chat=${chatId.slice(0, 8)} prompt=${promptTokens}tok completion=${completionTokens}tok${usage ? " (usage 実測)" : " (推定)"}`
+        );
         set((state) => ({
           generatingChatId: null,
           chats: state.chats.map((c) =>
@@ -231,6 +254,7 @@ export const useChatStore = create<ChatState>()(
         },
 
         deleteChat: (chatId) => {
+          appLog("debug", `チャット削除: chat=${chatId.slice(0, 8)}`);
           set((state) => {
             const chats = state.chats.filter((c) => c.id !== chatId);
             return {
@@ -244,6 +268,7 @@ export const useChatStore = create<ChatState>()(
         selectChat: (chatId) => set({ activeChatId: chatId }),
 
         deleteMessage: (chatId, messageId) => {
+          appLog("debug", `メッセージ削除: chat=${chatId.slice(0, 8)} msg=${messageId.slice(0, 8)}`);
           set((state) => ({
             chats: state.chats.map((c) =>
               c.id !== chatId ? c : { ...c, messages: c.messages.filter((m) => m.id !== messageId) }
@@ -252,6 +277,7 @@ export const useChatStore = create<ChatState>()(
         },
 
         editUserMessage: (chatId, messageId, content) => {
+          appLog("debug", `メッセージ編集・再生成: chat=${chatId.slice(0, 8)} msg=${messageId.slice(0, 8)}`);
           const chat = getChat(get().chats, chatId);
           if (!chat) return;
           const idx = chat.messages.findIndex((m) => m.id === messageId);
@@ -273,6 +299,7 @@ export const useChatStore = create<ChatState>()(
         },
 
         regenerate: (chatId, assistantMessageId) => {
+          appLog("debug", `再生成: chat=${chatId.slice(0, 8)} msg=${assistantMessageId.slice(0, 8)}`);
           const chat = getChat(get().chats, chatId);
           if (!chat) return;
           const idx = chat.messages.findIndex((m) => m.id === assistantMessageId);
@@ -307,6 +334,7 @@ export const useChatStore = create<ChatState>()(
         },
 
         stop: () => {
+          appLog("debug", "生成中断リクエスト");
           generationAbort?.abort();
         },
       };

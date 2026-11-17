@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Blocks,
   FileUp,
@@ -14,16 +14,17 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 import { APP_CONFIG } from "@/config/appConfig";
-import { useEngineStore } from "@/lib/engineStore";
+import { maxSingleFileSize, supportsMemory64, useEngineStore } from "@/lib/engineStore";
 import { useChatStore } from "@/lib/chatStore";
+import { useSettingsStore } from "@/lib/settingsStore";
 import { formatBytes } from "@/lib/tokenEstimate";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +36,11 @@ function ModelSection() {
   const isLoading = engine.status === "loading";
   const isReady = engine.status === "ready";
   const isGenerating = generatingChatId !== null;
+  const useWebGPU = useSettingsStore((s) => s.useWebGPU);
+  const setUseWebGPU = useSettingsStore((s) => s.setUseWebGPU);
+  // memory64 対応判定は SSR と結果が異なりうるため、マウント後に確定させる
+  const [mem64, setMem64] = useState<boolean | null>(null);
+  useEffect(() => setMem64(supportsMemory64()), []);
 
   const loadUrl = () => {
     if (!url.trim()) return;
@@ -98,8 +104,28 @@ function ModelSection() {
         />
         <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
           <FileUp className="size-3" />
-          単一ファイルは 2GB まで（wasm32 制約）。大きなモデルは分割 GGUF を利用してください。
+          {mem64
+            ? `お使いのブラウザは memory64 対応のため、単一ファイル最大 ${formatBytes(maxSingleFileSize())} まで試行できます。ただし 2GB 超は wllama の保証外のため分割 GGUF を推奨。`
+            : "単一ファイルは 2GB まで（wasm32 制約）。大きなモデルは分割 GGUF を利用してください。"}
         </p>
+      </div>
+
+      {/* バックエンド選択 */}
+      <div className="flex items-center justify-between rounded-md border p-2.5">
+        <div className="min-w-0 pr-2">
+          <Label htmlFor="use-webgpu" className="text-xs">
+            WebGPU を使用
+          </Label>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            オフにすると CPU (WASM) 強制で実行します（次回ロード時から適用）。
+          </p>
+        </div>
+        <Switch
+          id="use-webgpu"
+          checked={useWebGPU}
+          onCheckedChange={setUseWebGPU}
+          disabled={isLoading}
+        />
       </div>
 
       {/* 進捗 */}
@@ -325,7 +351,7 @@ function ChatListSection() {
   const generatingChatId = useChatStore((s) => s.generatingChatId);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex flex-col">
       <div className="flex items-center justify-between px-4 py-2">
         <h2 className="text-sm font-semibold">チャット履歴</h2>
         <Button
@@ -338,8 +364,7 @@ function ChatListSection() {
           <MessageSquarePlus className="size-4" />
         </Button>
       </div>
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-0.5 px-2 pb-3">
+      <div className="flex flex-col gap-0.5 px-2 pb-3">
           {chats.length === 0 && (
             <p className="px-2 py-4 text-xs text-muted-foreground">
               まだチャットがありません。「<Plus className="inline size-3" />」から作成できます。
@@ -378,21 +403,22 @@ function ChatListSection() {
                     deleteChat(c.id);
                   }
                 }}
-                className="opacity-0 transition-opacity group-hover:opacity-100"
+                className="shrink-0 rounded p-0.5 opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100"
               >
                 <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
               </span>
             </button>
           ))}
-        </div>
-      </ScrollArea>
+      </div>
     </div>
   );
 }
 
 export function LeftPanel() {
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    /* パネル全体を縦スクロール可能にする（モデル / LoRA セクションが
+       画面より高い場合でもチャット履歴へたどり着けるように） */
+    <div className="flex h-full min-h-0 flex-col overflow-y-auto">
       <ModelSection />
       <Separator />
       <LoraSection />

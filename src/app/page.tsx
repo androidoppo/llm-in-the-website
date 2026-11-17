@@ -11,6 +11,7 @@ import { ChatView } from "@/components/chat/ChatView";
 import { StatusBar } from "@/components/StatusBar";
 import { useChatStore } from "@/lib/chatStore";
 import { useSettingsStore } from "@/lib/settingsStore";
+import { installBrowserErrorHooks } from "@/lib/debugLogStore";
 
 export default function Home() {
   const [leftOpen, setLeftOpen] = useState(false);
@@ -21,6 +22,8 @@ export default function Home() {
 
   // localStorage から履歴・設定を復元（SSR でアクセスしないようクライアント側のみ）
   useEffect(() => {
+    // ブラウザ例外（window.onerror / unhandledrejection）をデバッグログへ収集
+    installBrowserErrorHooks();
     void Promise.all([
       useChatStore.persist.rehydrate(),
       useSettingsStore.persist.rehydrate(),

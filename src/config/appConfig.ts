@@ -20,6 +20,8 @@
  * 12. SYSTEM_PROMPT          既定のシステムプロンプト
  * 13. CONTEXT_WARNING_RATIO  コンテキスト使用率の警告しきい値（0.8 = 80%）
  * 14. CACHE_TYPE_K / CACHE_TYPE_V  KV キャッシュの量子化タイプ（GUI から変更可）
+ * 15. MAX_MODEL_FILE_SIZE_MEMORY64  memory64 対応ブラウザでの単一ファイル上限
+ * 16. AUTO_CPU_FALLBACK    WebGPU ロード失敗時に CPU (WASM) へ自動フォールバック
  */
 
 /** 既定モデル: ggml-org/Qwen3-0.6B-GGUF（Q4_0 / 約 410MB / チャットテンプレート同梱） */
@@ -30,6 +32,10 @@ export const APP_CONFIG = {
   // ---------- モデル ----------
   DEFAULT_MODEL_URL,
   MAX_MODEL_FILE_SIZE: 2 * 1024 * 1024 * 1024, // wasm32 の単一ファイル上限 (2GB)
+  /** memory64 対応ブラウザ（Safari 18.2+ / Chrome 133+ など）での単一ファイル上限。
+   *  wllama 自体は 2GB 超を保証していないため、超過時は「試行」してから
+   *  失敗時に分割 GGUF を案内する用途。 */
+  MAX_MODEL_FILE_SIZE_MEMORY64: 4 * 1024 * 1024 * 1024,
   PARALLEL_DOWNLOADS: 3,
 
   // ---------- コンテキスト / メモリ対策 (M-4: N_CTX 階梯回退) ----------
@@ -43,6 +49,10 @@ export const APP_CONFIG = {
   N_THREADS: 0, // 0 = 自動
   N_BATCH: 512,
   FLASH_ATTN: true,
+  /** WebGPU でのロード / 推論に失敗した場合に CPU (WASM) へ自動で切り替える。
+   *  iPadOS Safari のように WebGPU アダプタは取得できるがモデルロードに
+   *  失敗する環境向けの安全策。 */
+  AUTO_CPU_FALLBACK: true,
 
   // ---------- KV キャッシュ量子化（GUI から変更可・次回ロード時に適用） ----------
   /** V キャッシュを f16 以外にする場合は Flash Attention が必要（自動で有効化） */

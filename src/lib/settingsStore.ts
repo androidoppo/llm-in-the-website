@@ -22,7 +22,10 @@ const DEFAULT_PARAMS: GenerationParams = {
 
 interface SettingsState {
   params: GenerationParams;
+  /** WebGPU バックエンドを使用するか（オフ = CPU 強制）。次回モデルロード時に適用 */
+  useWebGPU: boolean;
   setParam: <K extends keyof GenerationParams>(key: K, value: GenerationParams[K]) => void;
+  setUseWebGPU: (v: boolean) => void;
   /** APP_CONFIG の値に戻す */
   resetToDefaults: () => void;
 }
@@ -31,22 +34,24 @@ export const useSettingsStore = create<SettingsState>()(
   persist(
     (set) => ({
       params: DEFAULT_PARAMS,
+      useWebGPU: true,
       setParam: (key, value) =>
         set((state) => ({ params: { ...state.params, [key]: value } })),
+      setUseWebGPU: (v) => set({ useWebGPU: v }),
       resetToDefaults: () => set({ params: DEFAULT_PARAMS }),
     }),
     {
       name: APP_CONFIG.SETTINGS_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
       skipHydration: true,
-      // 古い localStorage（cacheTypeK/V が存在しない）との互換:
-      // params は入れ替えではなく既定値とマージする
+      // 古い localStorage（cacheTypeK/V や useWebGPU が存在しない）との互換:
+      // 各フィールドは既定値とマージする（params の入れ替えはしない）
       merge: (persisted, current) => {
-        const persistedParams =
-          (persisted as { params?: Partial<GenerationParams> } | undefined)?.params ?? {};
+        const p = (persisted as Partial<SettingsState> | undefined) ?? {};
         return {
           ...current,
-          params: { ...DEFAULT_PARAMS, ...persistedParams },
+          useWebGPU: p.useWebGPU ?? current.useWebGPU,
+          params: { ...DEFAULT_PARAMS, ...p.params },
         };
       },
     }

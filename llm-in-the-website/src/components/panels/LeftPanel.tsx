@@ -18,7 +18,6 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
@@ -352,7 +351,7 @@ function ChatListSection() {
   const generatingChatId = useChatStore((s) => s.generatingChatId);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex flex-col">
       <div className="flex items-center justify-between px-4 py-2">
         <h2 className="text-sm font-semibold">チャット履歴</h2>
         <Button
@@ -365,8 +364,7 @@ function ChatListSection() {
           <MessageSquarePlus className="size-4" />
         </Button>
       </div>
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-0.5 px-2 pb-3">
+      <div className="flex flex-col gap-0.5 px-2 pb-3">
           {chats.length === 0 && (
             <p className="px-2 py-4 text-xs text-muted-foreground">
               まだチャットがありません。「<Plus className="inline size-3" />」から作成できます。
@@ -411,15 +409,16 @@ function ChatListSection() {
               </span>
             </button>
           ))}
-        </div>
-      </ScrollArea>
+      </div>
     </div>
   );
 }
 
 export function LeftPanel() {
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    /* パネル全体を縦スクロール可能にする（モデル / LoRA セクションが
+       画面より高い場合でもチャット履歴へたどり着けるように） */
+    <div className="flex h-full min-h-0 flex-col overflow-y-auto">
       <ModelSection />
       <Separator />
       <LoraSection />

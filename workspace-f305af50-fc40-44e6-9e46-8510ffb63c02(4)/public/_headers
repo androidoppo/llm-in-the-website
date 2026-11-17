@@ -1,6 +1,0 @@
-# Cloudflare Pages 用 HTTP ヘッダ設定
-# COOP/COEP による crossOriginIsolated 環境を構築し、
-# wllama のマルチスレッド WASM と WebGPU バックエンドを有効化する。
-/*
-  Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Embedder-Policy: require-corp

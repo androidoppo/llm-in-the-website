@@ -6,6 +6,8 @@
  * - 推論本体は wllama 内部の Web Worker で実行されるため UI はブロックされない
  * - モデルはメモリ上でのみ動作（URL 导入はキャッシュしない / 計画書 M-2）
  * - メモリ対策として N_CTX の階梯フォールバックを実装（計画書 M-4）
+ * - WebGPU ロード失敗時は CPU (WASM) へ自動フォールバックする
+ *   （iPadOS Safari のようにアダプタは取得できるがロードに失敗する環境向け）
  * - LoRA アダプタはモデルロード時に wllama の lora_adapters として適用する
  *   （wllama はロード時に MEMFS へ全 blob を model-XXXXX-of-XXXXX.gguf として
  *    登録するため、LoRA blob をモデル blob の後ろに並べて仮想パスを指定する）
@@ -14,10 +16,74 @@ import { create } from "zustand";
 import { Wllama } from "@wllama/wllama";
 import type { LoadedContextInfo } from "@wllama/wllama";
 import { APP_CONFIG } from "@/config/appConfig";
+import { pushDebugLog } from "@/lib/debugLogStore";
 import { useSettingsStore } from "@/lib/settingsStore";
+import { formatBytes } from "@/lib/tokenEstimate";
 import type { EngineStatus, LoraAdapter, LoadProgress } from "@/lib/types";
 
 let wllamaInstance: Wllama | null = null;
+
+/**
+ * memory64（WebAssembly.Memory の 64 ビットアドレス空間）に対応しているか。
+ * Safari 18.2+ / Chrome 133+ / Firefox 134+ あたりが目安。
+ * 対応ブラウザでは 2GB 超の単一 GGUF にも「試行」できる。
+ */
+export function supportsMemory64(): boolean {
+  if (typeof WebAssembly === "undefined") return false;
+  try {
+    // TypeScript 標準型に address オプションが無いためキャストする。
+    // memory64 対応ブラウザ（Safari 18.2+ / Chrome 133+ / Firefox 134+ 目安）のみ成功する。
+    const desc = {
+      initial: 1,
+      maximum: 2,
+      address: "memory64",
+    } as unknown as WebAssembly.MemoryDescriptor;
+    const m = new WebAssembly.Memory(desc);
+    void m.buffer.byteLength; // 実際に触って検証
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** モバイルデバイスかどうか（エラーメッセージの調整用） */
+function isMobileDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return (
+    /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) ||
+    (/Macintosh/.test(navigator.userAgent) && "ontouchend" in document)
+  );
+}
+
+/**
+ * GGUF ヘッダの最初の KV（一般には general.architecture）を読み出す。
+ * ロード失敗時の診断情報（「このアーキテクチャがビルド未対応の可能性」）として使う。
+ */
+async function readGgufArch(blob: Blob): Promise<string | null> {
+  try {
+    const buf = await blob.slice(0, 512).arrayBuffer();
+    const view = new DataView(buf);
+    // magic "GGUF" (LE で 0x46554747) を確認
+    if (view.byteLength < 32 || view.getUint32(0, true) !== 0x46554747) return null;
+    let off = 8; // magic(4) + version(4)
+    off += 16; // tensor_count(u64) + kv_count(u64)
+    const decoder = new TextDecoder();
+    const readStr = (): string => {
+      const len = Number(view.getBigUint64(off, true));
+      off += 8;
+      const s = decoder.decode(new Uint8Array(buf, off, len));
+      off += len;
+      return s;
+    };
+    const key = readStr();
+    const vtype = view.getUint32(off, true);
+    off += 4;
+    if (key !== "general.architecture" || vtype !== 8) return null; // 8 = GGUF Type STRING
+    return readStr();
+  } catch {
+    return null;
+  }
+}
 
 /**
  * wllama のログを監視し、WebGPU アダプタの初期化失敗を検知したら
@@ -31,18 +97,33 @@ function watchWebGPUFailure(args: unknown[]) {
   }
 }
 
+/**
+ * wllama の logger。全レベルをデバッグログストアへ収集し、
+ * warn / error はコンソールにも出力する。
+ */
 const engineLogger = {
-  debug: () => {},
-  log: () => {},
+  debug: (...args: unknown[]) => {
+    pushDebugLog("debug", "wllama", args.map(String).join(" "));
+  },
+  log: (...args: unknown[]) => {
+    pushDebugLog("info", "wllama", args.map(String).join(" "));
+  },
   warn: (...args: unknown[]) => {
     watchWebGPUFailure(args);
+    pushDebugLog("warn", "wllama", args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : String(a))).join(" "));
     console.warn(...args);
   },
   error: (...args: unknown[]) => {
     watchWebGPUFailure(args);
+    pushDebugLog("error", "wllama", args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : String(a))).join(" "));
     console.error(...args);
   },
 };
+
+/** アプリ内部ログのショートカット */
+function appLog(level: "debug" | "info" | "warn" | "error", message: string) {
+  pushDebugLog(level, "app", message);
+}
 
 export function getWllama(): Wllama {
   if (!wllamaInstance) {
@@ -60,6 +141,13 @@ export function getWllama(): Wllama {
     );
   }
   return wllamaInstance;
+}
+
+/** 単一ファイルの実効上限（memory64 対応ブラウザでは緩和） */
+export function maxSingleFileSize(): number {
+  return supportsMemory64()
+    ? APP_CONFIG.MAX_MODEL_FILE_SIZE_MEMORY64
+    : APP_CONFIG.MAX_MODEL_FILE_SIZE;
 }
 
 /**
@@ -180,7 +268,7 @@ function buildLoraAdaptersParams(
 interface EngineState {
   status: EngineStatus;
   progress: LoadProgress | null;
-  /** ロード中にフォールバックしたコンテキスト長（警告表示用） */
+  /** ロード中のフォールバック（コンテキスト引き下げ / CPU 切替）の通知 */
   ctxFallbackNotice: string | null;
   error: string | null;
   ctxInfo: LoadedContextInfo | null;
@@ -230,7 +318,7 @@ async function safeExit(wllama: Wllama) {
   try {
     await wllama.exit();
   } catch (err) {
-    console.warn("exit 中の警告:", err);
+    appLog("debug", `wllama.exit() の警告: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -243,36 +331,99 @@ async function safeExit(wllama: Wllama) {
 function assertLoadSucceeded(wllama: Wllama): LoadedContextInfo {
   const info = wllama.getLoadedContextInfo();
   if (!info || info.n_ctx <= 0 || info.n_layer <= 0) {
+    appLog("error", "ロード検証失敗: getLoadedContextInfo() が無効値（nullptr 応答の疑い）");
     throw new Error(
       "モデルの読み込みに失敗しました。GGUF ファイルが破損しているか、対応していない形式の可能性があります。"
     );
   }
+  appLog("info", `ロード検証 OK: n_ctx=${info.n_ctx} n_layer=${info.n_layer}`);
   return info;
 }
 
-async function loadWithLadder(
+/** ロード試行: n_ctx とバックエンドを受け取り、ロード + 成功検証まで行う */
+type LoadAttempt = (nCtx: number, webgpu: boolean) => Promise<void>;
+
+/**
+ * メモリ階梯 × バックエンド（WebGPU → CPU）の二段フォールバック。
+ *
+ * - メモリ不足エラー: 同じバックエンドで次の n_ctx 階梯を試す
+ * - それ以外のロード失敗（C++ 側ロード失敗・nullptr 応答など）:
+ *   WebGPU の場合だけ CPU (WASM) へ切り替えて再試行する。
+ *   iPadOS Safari のように requestAdapter は成功するが WebGPU バックエンドでの
+ *   モデルロードが失敗する環境があるため。
+ * - CPU でも失敗した場合は元のエラーをそのまま投げる
+ */
+async function loadWithFallbacks(
   wllama: Wllama,
-  load: (nCtx: number) => Promise<void>
-): Promise<number | null> {
+  attempt: LoadAttempt,
+  preferWebGPU: boolean
+): Promise<{ ctxFallback: number | null; cpuFallback: boolean }> {
   const ladder = [APP_CONFIG.N_CTX, ...APP_CONFIG.N_CTX_FALLBACK_LADDER];
+  const backends: boolean[] =
+    preferWebGPU && APP_CONFIG.AUTO_CPU_FALLBACK ? [true, false] : [preferWebGPU];
   let lastErr: unknown = null;
-  for (let i = 0; i < ladder.length; i++) {
-    const nCtx = ladder[i];
-    try {
-      await load(nCtx);
-      if (i > 0) {
-        return nCtx; // フォールバックで成功したコンテキスト長
+  let ctxFallback: number | null = null;
+  let cpuFallback = false;
+  for (let b = 0; b < backends.length; b++) {
+    const webgpu = backends[b];
+    for (let i = 0; i < ladder.length; i++) {
+      const nCtx = ladder[i];
+      try {
+        appLog("info", `ロード試行: backend=${webgpu ? "WebGPU" : "CPU"} n_ctx=${nCtx}`);
+        await attempt(nCtx, webgpu);
+        if (i > 0) ctxFallback = nCtx;
+        cpuFallback = !webgpu && backends.length > 1;
+        return { ctxFallback, cpuFallback };
+      } catch (err) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        appLog(
+          "warn",
+          `ロード失敗: backend=${webgpu ? "WebGPU" : "CPU"} n_ctx=${nCtx} memoryError=${isMemoryError(err)}: ${msg}`
+        );
+        console.warn(
+          `ロード失敗: backend=${webgpu ? "WebGPU" : "CPU"} n_ctx=${nCtx}`,
+          err
+        );
+        await safeExit(wllama);
+        if (!isMemoryError(err)) {
+          // メモリ不足以外（未対応形式・バックエンド故障など）はバックエンドを切り替え
+          appLog("info", "メモリ不足以外のため次のバックエンドへ切り替えます");
+          break;
+        }
+        // メモリ不足なら次の n_ctx 階梯へ
+        appLog("info", "メモリ不足と判定 → 次の n_ctx 階梯へ");
       }
-      return null;
-    } catch (err) {
-      lastErr = err;
-      if (!isMemoryError(err)) throw err;
-      console.warn(`n_ctx=${nCtx} でロード失敗（メモリ不足と推定）。次の階梯を試行します。`, err);
-      // リトライ前にメモリを解放し「Module is already initialized」を防ぐ
-      await safeExit(wllama);
     }
   }
   throw lastErr;
+}
+
+/** 最終エラーメッセージを用途別に補足する */
+async function describeLoadError(
+  err: unknown,
+  firstModelFile: Blob | null
+): Promise<string> {
+  const base = err instanceof Error ? err.message : String(err);
+  if (isMemoryError(err)) {
+    const size = useEngineStore.getState().modelSizeBytes ?? null;
+    if (size !== null && size > 2 * 1024 * 1024 * 1024) {
+      return `${base} モデルが大きいため、より小さい量子化（Q4_K_S / Q4_0 など）や分割 GGUF の利用を検討してください。`;
+    }
+    if (isMobileDevice()) {
+      return `${base} モバイルデバイスでは搭載メモリの制約が厳しいため、より小さいモデル（低量子化・少パラメータ）をお試しください。`;
+    }
+    return base;
+  }
+  // C++ 側ロード失敗（未対応形式・破損）の可能性
+  const arch = firstModelFile ? await readGgufArch(firstModelFile) : null;
+  if (arch) {
+    return `${base}（検出されたアーキテクチャ: ${arch}。お使いの llama.cpp ビルドがこの形式に未対応、またはファイルが破損している可能性があります）`;
+  }
+  if (base.startsWith("モデルの読み込みに失敗")) {
+    return `${base}（WebGPU / CPU の両バックエンドで失敗しました。ファイルが破損しているか、お使いの llama.cpp ビルドがこの形式に未対応の可能性があります）`;
+  }
+  return base;
 }
 
 /** 有効化されている LoRA をすべて blob 化して返す（URL のものはこの場でダウンロード） */
@@ -387,14 +538,38 @@ export const useEngineStore = create<EngineState>((set, get) => ({
   loadFromUrl: async (url) => {
     const wllama = getWllama();
     if (get().status === "loading") return;
+    appLog("info", `モデルロード開始 (URL): ${url}`);
     if (!isGgufFileName(nameFromUrl(url))) {
       set({ error: "URL は .gguf で終わる必要があります。" });
       return;
     }
+    const useWebGPUSetting = useSettingsStore.getState().useWebGPU;
     // 既存のモデル / 失敗残留の WASM モジュールを解放（再ロード・モデル切替を可能にする）
     await safeExit(wllama);
+
+    // 2GB 超の非分割単一 GGUF を事前検査（memory64 非対応ならダウンロード前に案内）
+    const maxSingle = maxSingleFileSize();
+    const isShard = deriveShardUrls(url).length > 1;
+    try {
+      const head = await fetch(url, { method: "HEAD" });
+      const len = Number(head.headers.get("content-length") ?? 0);
+      appLog("debug", `HEAD content-length=${len ? formatBytes(len) : "不明"} isShard=${isShard}`);
+      if (len > maxSingle && !isShard) {
+        set({
+          status: "error",
+          error: `このモデルは ${formatBytes(len)} あり、単一ファイル上限（${formatBytes(maxSingle)}）を超えています。split GGUF の先頭シャード URL（-00001-of-0000N.gguf）を指定するか、より小さい量子化をご利用ください。${
+            supportsMemory64() ? "" : "（お使いのブラウザは memory64 非対応のため、2GB 超の単一ファイルはロードできません）"
+          }`,
+        });
+        return;
+      }
+    } catch {
+      // HEAD が使えないサーバ（CORS 等）は素通りして通常フローへ
+    }
+
     // WebGPU アダプタの実在を事前検証（表示と n_gpu_layers の両方に使用）
-    const webgpu = await isWebGPUAdapterAvailable();
+    const adapterAvailable = await isWebGPUAdapterAvailable();
+    const preferGPU = useWebGPUSetting && adapterAvailable && APP_CONFIG.N_GPU_LAYERS > 0;
     set({
       status: "loading",
       progress: null,
@@ -402,8 +577,8 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       ctxFallbackNotice: null,
       modelName: nameFromUrl(url),
       modelSizeBytes: null,
-      webgpuSupported: webgpu,
-      webgpuActive: webgpu,
+      webgpuSupported: adapterAvailable,
+      webgpuActive: preferGPU,
     });
 
     const setProgress = (loaded: number, total: number) =>
@@ -420,24 +595,28 @@ export const useEngineStore = create<EngineState>((set, get) => ({
 
       if (loras.length === 0) {
         // LoRA なし: 従来どおり wllama のダウンローダを使用
-        const fallback = await loadWithLadder(wllama, async (nCtx) => {
-          await wllama.loadModelFromUrl(url, {
-            ...buildLoadParams(nCtx, webgpu),
-            // 計画書 M-2: モデルはメモリ上でのみ動作させ、キャッシュは保持しない
-            useCache: false,
-            progressCallback: ({ loaded, total }) => setProgress(loaded, total),
-          });
-          assertLoadSucceeded(wllama);
-        });
+        // （URL が split GGUF の先頭シャードなら wllama が全シャードを自動展開する）
+        const { ctxFallback, cpuFallback } = await loadWithFallbacks(
+          wllama,
+          async (nCtx, webgpu) => {
+            set({ webgpuActive: webgpu });
+            await wllama.loadModelFromUrl(url, {
+              ...buildLoadParams(nCtx, webgpu),
+              // 計画書 M-2: モデルはメモリ上でのみ動作させ、キャッシュは保持しない
+              useCache: false,
+              progressCallback: ({ loaded, total }) => setProgress(loaded, total),
+            });
+            assertLoadSucceeded(wllama);
+          },
+          preferGPU
+        );
         const ctxInfo = wllama.getLoadedContextInfo();
         set({
           status: "ready",
           progress: null,
           ctxInfo,
           multithread: wllama.isMultithread(),
-          ctxFallbackNotice: fallback
-            ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
-            : null,
+          ctxFallbackNotice: buildFallbackNotice(ctxFallback, cpuFallback),
           contextTokens: 0,
           tokPerSec: null,
         });
@@ -471,10 +650,15 @@ export const useEngineStore = create<EngineState>((set, get) => ({
         scales.map((s) => ({ scale: s }))
       );
 
-      const fallback = await loadWithLadder(wllama, async (nCtx) => {
-        await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpu, loraAdaptersParams));
-        assertLoadSucceeded(wllama);
-      });
+      const { ctxFallback, cpuFallback } = await loadWithFallbacks(
+        wllama,
+        async (nCtx, webgpu) => {
+          set({ webgpuActive: webgpu });
+          await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpu, loraAdaptersParams));
+          assertLoadSucceeded(wllama);
+        },
+        preferGPU
+      );
       const ctxInfo = wllama.getLoadedContextInfo();
       set({
         status: "ready",
@@ -482,19 +666,18 @@ export const useEngineStore = create<EngineState>((set, get) => ({
         ctxInfo,
         multithread: wllama.isMultithread(),
         modelSizeBytes: modelSize + loraSizeBytes,
-        ctxFallbackNotice: fallback
-          ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
-          : null,
+        ctxFallbackNotice: buildFallbackNotice(ctxFallback, cpuFallback),
         contextTokens: 0,
         tokPerSec: null,
       });
     } catch (err) {
       console.error(err);
+      appLog("error", `モデルロード失敗 (URL): ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
       await safeExit(wllama);
       set({
         status: "error",
         progress: null,
-        error: err instanceof Error ? err.message : String(err),
+        error: await describeLoadError(err, null),
       });
     }
   },
@@ -512,14 +695,27 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       set({ error: `GGUF 形式のみ対応しています: ${invalid.name}` });
       return;
     }
-    const oversize = files.find((f) => f.size > APP_CONFIG.MAX_MODEL_FILE_SIZE);
+    // 単一ファイル上限: memory64 非対応ブラウザでは 2GB（wllama の制約）、
+    // 対応ブラウザでは緩和した上限で「試行」する
+    const maxSingle = maxSingleFileSize();
+    const mem64 = supportsMemory64();
+    const oversize = files.find((f) => f.size > maxSingle);
     if (oversize) {
       set({
-        error: `単一ファイルは 2GB までです（wasm32 制約）。大きなモデルは split GGUF を利用してください: ${oversize.name}`,
+        error: `単一ファイルは ${formatBytes(maxSingle)} までです: ${oversize.name}${
+          mem64
+            ? "。これ以上のモデルは llama-gguf-split などで分割し、シャードを複数選択してください。"
+            : "。2GB 超のモデルは llama-gguf-split などで分割 GGUF にして、シャードを複数選択してください（例: -00001-of-00003.gguf 〜）。"
+        }`,
       });
       return;
     }
-    const webgpu = await isWebGPUAdapterAvailable();
+    const useWebGPUSetting = useSettingsStore.getState().useWebGPU;
+    const webgpu = useWebGPUSetting && (await isWebGPUAdapterAvailable());
+    appLog(
+      "info",
+      `モデルロード開始 (ファイル): ${files.map((f) => `${f.name}(${formatBytes(f.size)})`).join(", ")} mem64=${mem64} webgpu=${webgpu}`
+    );
     set({
       status: "loading",
       progress: null,
@@ -554,10 +750,15 @@ export const useEngineStore = create<EngineState>((set, get) => ({
           ? buildLoraAdaptersParams(files.length, loraScales.map((s) => ({ scale: s })))
           : undefined;
 
-      const fallback = await loadWithLadder(wllama, async (nCtx) => {
-        await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpu, loraAdaptersParams));
-        assertLoadSucceeded(wllama);
-      });
+      const { ctxFallback, cpuFallback } = await loadWithFallbacks(
+        wllama,
+        async (nCtx, webgpuNow) => {
+          set({ webgpuActive: webgpuNow });
+          await wllama.loadModel(blobs, buildLoadParams(nCtx, webgpuNow, loraAdaptersParams));
+          assertLoadSucceeded(wllama);
+        },
+        webgpu
+      );
       const ctxInfo = wllama.getLoadedContextInfo();
       set({
         status: "ready",
@@ -565,19 +766,18 @@ export const useEngineStore = create<EngineState>((set, get) => ({
         ctxInfo,
         multithread: wllama.isMultithread(),
         modelSizeBytes: files.reduce((acc, f) => acc + f.size, 0) + loraSizeBytes,
-        ctxFallbackNotice: fallback
-          ? `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${fallback} に引き下げてロードしました。`
-          : null,
+        ctxFallbackNotice: buildFallbackNotice(ctxFallback, cpuFallback),
         contextTokens: 0,
         tokPerSec: null,
       });
     } catch (err) {
       console.error(err);
+      appLog("error", `モデルロード失敗 (ファイル): ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
       await safeExit(wllama);
       set({
         status: "error",
         progress: null,
-        error: err instanceof Error ? err.message : String(err),
+        error: await describeLoadError(err, files[0] ?? null),
       });
     }
   },
@@ -585,6 +785,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
   unload: async () => {
     const wllama = wllamaInstance;
     if (!wllama) return;
+    appLog("info", "モデルをアンロードします");
     await safeExit(wllama);
     set({
       status: "idle",
@@ -601,3 +802,19 @@ export const useEngineStore = create<EngineState>((set, get) => ({
     });
   },
 }));
+
+/** フォールバック結果をユーザ向け通知文に変換する */
+function buildFallbackNotice(ctxFallback: number | null, cpuFallback: boolean): string | null {
+  const parts: string[] = [];
+  if (cpuFallback) {
+    parts.push(
+      "WebGPU でのロードに失敗したため、CPU (WASM) で再試行してロードしました。"
+    );
+  }
+  if (ctxFallback) {
+    parts.push(
+      `メモリ制約のためコンテキスト長を ${APP_CONFIG.N_CTX} → ${ctxFallback} に引き下げました。`
+    );
+  }
+  return parts.length > 0 ? parts.join("") : null;
+}
