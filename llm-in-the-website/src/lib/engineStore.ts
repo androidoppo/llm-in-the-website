@@ -284,9 +284,13 @@ interface EngineState {
   contextTokens: number;
   /** 登録済み LoRA アダプタ（メモリ上のみ・アンロード後も保持） */
   loraAdapters: LoraAdapter[];
+  /** 直近のロード元（WebGPU 推論クラッシュ時の自動再ロード用） */
+  lastLoad: LastLoad | null;
 
-  loadFromUrl: (url: string) => Promise<void>;
-  loadFromFiles: (files: File[]) => Promise<void>;
+  loadFromUrl: (url: string, opts?: { forceWebGPU?: boolean }) => Promise<void>;
+  loadFromFiles: (files: File[], opts?: { forceWebGPU?: boolean }) => Promise<void>;
+  /** WebGPU 推論クラッシュ後に CPU (WASM) で再ロードする。成功時 true */
+  retryAfterWebgpuCrash: () => Promise<boolean>;
   unload: () => Promise<void>;
   addLoraFiles: (files: File[]) => void;
   addLoraUrl: (url: string) => void;
@@ -296,6 +300,20 @@ interface EngineState {
   setTokPerSec: (t: number | null) => void;
   setContextTokens: (n: number) => void;
   clearError: () => void;
+}
+
+/** 直近のロード元（URL またはローカルファイル群） */
+type LastLoad = { kind: "url"; url: string } | { kind: "files"; files: File[] };
+
+/**
+ * WebGPU 推論中のクラッシュ（ggml-webgpu のキュー待ちタイムアウト等）かを判定する。
+ * iPadOS Safari のように「ロードは成功するが推論で固まる」環境の自動リカバリ用。
+ */
+export function isWebgpuInferenceCrash(err: unknown): boolean {
+  if (!useEngineStore.getState().webgpuActive) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? (err.stack ?? "") : "";
+  return /Queue wait timed out|ggml_webgpu|\(ABORT\)|has crashed/i.test(`${msg}\n${stack}`);
 }
 
 function buildLoadParams(nCtx: number, webgpu: boolean, loraAdapters?: { path: string; scale: number }[]) {
@@ -463,11 +481,42 @@ export const useEngineStore = create<EngineState>((set, get) => ({
   tokPerSec: null,
   contextTokens: 0,
   loraAdapters: [],
+  lastLoad: null,
 
   clearError: () => set({ error: null }),
 
   setTokPerSec: (t) => set({ tokPerSec: t }),
   setContextTokens: (n) => set({ contextTokens: n }),
+
+  // ---------- WebGPU 推論クラッシュからの自動リカバリ ----------
+  retryAfterWebgpuCrash: async () => {
+    const last = get().lastLoad;
+    if (!last) return false;
+    appLog("warn", "WebGPU 推論でクラッシュ。CPU (WASM) で再ロードします");
+    // 以降のロードでも CPU を既定にする（設定は localStorage に保持され、
+    // ユーザーが設定トグルで再度有効化できる）
+    useSettingsStore.getState().setUseWebGPU(false);
+    // クラッシュした WASM モジュールは復帰不能なため破棄して作り直す
+    const wllama = wllamaInstance;
+    if (wllama) await safeExit(wllama);
+    wllamaInstance = null;
+    getWllama();
+    if (last.kind === "url") {
+      await get().loadFromUrl(last.url, { forceWebGPU: false });
+    } else {
+      await get().loadFromFiles(last.files, { forceWebGPU: false });
+    }
+    if (get().status !== "ready") {
+      appLog("error", "CPU (WASM) での再ロードにも失敗しました");
+      return false;
+    }
+    set({
+      ctxFallbackNotice:
+        "WebGPU での推論中にエラーが発生したため、CPU (WASM) で再ロードしました。WebGPU を使いたい場合は設定トグルをオンにして再ロードしてください。",
+    });
+    appLog("info", "CPU (WASM) での再ロード完了。生成を再試行します");
+    return true;
+  },
 
   // ---------- LoRA 管理 ----------
   addLoraFiles: (files) => {
@@ -535,7 +584,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
     })),
 
   // ---------- モデルロード ----------
-  loadFromUrl: async (url) => {
+  loadFromUrl: async (url, opts) => {
     const wllama = getWllama();
     if (get().status === "loading") return;
     appLog("info", `モデルロード開始 (URL): ${url}`);
@@ -569,7 +618,11 @@ export const useEngineStore = create<EngineState>((set, get) => ({
 
     // WebGPU アダプタの実在を事前検証（表示と n_gpu_layers の両方に使用）
     const adapterAvailable = await isWebGPUAdapterAvailable();
-    const preferGPU = useWebGPUSetting && adapterAvailable && APP_CONFIG.N_GPU_LAYERS > 0;
+    // forceWebGPU が指定された場合はその値を優先（クラッシュ後の CPU 強制再ロード用）
+    const preferGPU =
+      opts?.forceWebGPU !== undefined
+        ? opts.forceWebGPU
+        : useWebGPUSetting && adapterAvailable && APP_CONFIG.N_GPU_LAYERS > 0;
     set({
       status: "loading",
       progress: null,
@@ -579,6 +632,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       modelSizeBytes: null,
       webgpuSupported: adapterAvailable,
       webgpuActive: preferGPU,
+      lastLoad: { kind: "url", url },
     });
 
     const setProgress = (loaded: number, total: number) =>
@@ -682,7 +736,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
     }
   },
 
-  loadFromFiles: async (files) => {
+  loadFromFiles: async (files, opts) => {
     const wllama = getWllama();
     if (get().status === "loading") return;
     if (files.length === 0) return;
@@ -711,7 +765,10 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       return;
     }
     const useWebGPUSetting = useSettingsStore.getState().useWebGPU;
-    const webgpu = useWebGPUSetting && (await isWebGPUAdapterAvailable());
+    const webgpu =
+      opts?.forceWebGPU !== undefined
+        ? opts.forceWebGPU
+        : useWebGPUSetting && (await isWebGPUAdapterAvailable());
     appLog(
       "info",
       `モデルロード開始 (ファイル): ${files.map((f) => `${f.name}(${formatBytes(f.size)})`).join(", ")} mem64=${mem64} webgpu=${webgpu}`
@@ -725,6 +782,7 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       modelSizeBytes: files.reduce((acc, f) => acc + f.size, 0),
       webgpuSupported: webgpu,
       webgpuActive: webgpu,
+      lastLoad: { kind: "files", files },
     });
     try {
       const enabledLoras = get().loraAdapters.filter((a) => a.enabled);

@@ -13,7 +13,7 @@ import { v4 as uuidv4 } from "uuid";
 import type { Wllama } from "@wllama/wllama";
 import { APP_CONFIG } from "@/config/appConfig";
 import { pushDebugLog } from "@/lib/debugLogStore";
-import { useEngineStore, getWllama } from "@/lib/engineStore";
+import { useEngineStore, getWllama, isWebgpuInferenceCrash } from "@/lib/engineStore";
 import { useSettingsStore } from "@/lib/settingsStore";
 import { estimateTokens } from "@/lib/tokenEstimate";
 import type { Chat, ChatMessage, Role } from "@/lib/types";
@@ -92,7 +92,12 @@ export const useChatStore = create<ChatState>()(
         }));
       };
 
-      const runGeneration = async (chatId: string, history: ChatMessage[]) => {
+      const runGeneration = async (
+        chatId: string,
+        history: ChatMessage[],
+        /** WebGPU クラッシュ時の自動再試行を許可するか（無限ループ防止のため 1 回のみ） */
+        allowWebgpuRetry = true
+      ) => {
         const engine = useEngineStore.getState();
         if (engine.status !== "ready") {
           set({ lastError: "モデルがロードされていません。先にモデルを読み込んでください。" });
@@ -183,7 +188,6 @@ export const useChatStore = create<ChatState>()(
             console.error("生成エラー:", err);
             const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
             appLog("error", `生成エラー: chat=${chatId.slice(0, 8)} ${msg}`);
-            set({ lastError: `生成中にエラーが発生しました: ${msg}` });
             if (buffer.length === 0) {
               // 空のままならプレースホルダを取り除く
               set((state) => ({
@@ -196,6 +200,25 @@ export const useChatStore = create<ChatState>()(
             } else {
               patchMessage(chatId, assistantMsg.id, { content: buffer, stopped: true });
             }
+
+            // WebGPU 推論クラッシュ（キュー待ちタイムアウト等）の自動リカバリ:
+            // CPU (WASM) でモデルを再ロードし、同じ入力で 1 回だけ再試行する
+            if (allowWebgpuRetry && isWebgpuInferenceCrash(err)) {
+              appLog("info", "WebGPU 推論クラッシュを検出 → CPU で再ロードして再試行します");
+              const recovered = await useEngineStore.getState().retryAfterWebgpuCrash();
+              if (recovered) {
+                await runGeneration(chatId, history, false);
+                return;
+              }
+              set({
+                generatingChatId: null,
+                lastError:
+                  "WebGPU での推論に失敗し、CPU (WASM) での再ロードもできませんでした。小さいモデルをお試しください。",
+              });
+              return;
+            }
+
+            set({ lastError: `生成中にエラーが発生しました: ${msg}` });
           }
         } finally {
           generationAbort = null;
